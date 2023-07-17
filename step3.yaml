@@ -1,0 +1,48 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Configure the SsmLambdaRole IAM role to allow Amazon Lambda function from central account to assume it and gather the required details.
+Parameters:
+  SsmLambdaRoleName:
+    Description: The name for LambdaSsmOsDetailRole IAM role
+    Type: String
+    Default: ssmLambdaRole
+  MasterAccountId:
+    Type: String
+    Description: The ID of the primary account from which automations will be initiated for your organization.
+    MaxLength: 12
+    MinLength: 12
+Resources:
+  MyIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 
+        Ref: SsmLambdaRoleName
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub:
+                - arn:aws:iam::${MasterAccountId}:role/LambdaSsmOsDetailRole
+                - MasterAccountId:
+                    Ref: MasterAccountId
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+  MyIAMPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: ssmLambdaPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: DescribeAccess
+            Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ssm:DescribeInstanceInformation
+              - ec2:DescribeRegions
+              - ec2:DescribeImages
+            Resource: '*'
+      Roles:
+        - !Ref MyIAMRole

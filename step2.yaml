@@ -1,0 +1,45 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Configure the IAM role to allow lambda function to assume this from a sub-account account of AWS Organization
+Parameters:
+  ManagementOrganizationRoleName:
+    Description: The name for ManagementOrganizationRole IAM role
+    Type: String
+    Default: ManagementOrganizationRole
+  DelegateAccountId:
+    Type: String
+    Description: The ID of the account which will assume the IAM role ManagementOrganizationRole to get the list of accounts in the AWS Organization
+    MaxLength: 12
+    MinLength: 12
+Resources:
+  OrgIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 
+        Ref: ManagementOrganizationRoleName
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub:
+                - arn:${AWS::Partition}:iam::${DelegateAccountId}:assumed-role/LambdaSsmOsDetailRole/LambdaSsmOsFunction
+                - DelegateAccountId:
+                    Ref: DelegateAccountId
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+  OrgIAMPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: ManagementOrganizationPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: OrganizationListAccountAccess
+            Effect: Allow
+            Action:
+              - organizations:ListAccounts
+            Resource: '*'
+      Roles:
+        - !Ref OrgIAMRole

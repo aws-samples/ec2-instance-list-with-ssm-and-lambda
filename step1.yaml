@@ -1,0 +1,239 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Configure the LambdaSsmOsDetailRole IAM role to allow Amazon Lambda function to assume ssmLambdaRole in target accounts. **WARNING** This template creates Amazon Lambda function which on execution will create object in Amazon S3 bucket and Amazon cloudwatch log group. You will be billed for the AWS resources used if you create a stack from this template.
+Parameters:
+  LambdaSsmOsDetailRoleName:
+    Description: The name for LambdaSsmOsDetailRole IAM role
+    Type: String
+    Default: LambdaSsmOsDetailRole
+  S3BucketName:
+    Type: String
+    Description: S3 bucket where the report needs to be uploaded
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9_-]*'
+  ManagementOrPayerAccountId:
+    Type: String
+    Description: The ID of the management account or payer account which has the IAM role 'ManagementOrganizationRole' to get the list of accounts in the AWS Organization. Leave it empty if this AWS Cloudformation template is executed in management account or payer account. This is needed when the AWS Cloudformation template is executed in any sub-account of the organization
+    AllowedPattern: ^\d{12}$|^$
+    Default: ''
+Conditions:
+  ManagementOrPayerAccountIdEmpty:  !Equals [!Ref ManagementOrPayerAccountId, '']
+  ManagementOrPayerAccountIdNotEmpty: !Not [Condition: ManagementOrPayerAccountIdEmpty]
+Resources:
+  MasterAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      RoleName: 
+        Ref: LambdaSsmOsDetailRoleName
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaSsmOsDetailPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource:
+                  - Fn::Sub: arn:aws:iam::*:role/ssmLambdaRole
+                  - Fn::If:
+                      - ManagementOrPayerAccountIdNotEmpty
+                      - Fn::Sub: arn:aws:iam::${ManagementOrPayerAccountId}:role/ManagementOrganizationRole
+                      - Ref: AWS::NoValue
+              - Effect: Allow
+                Action: organizations:ListAccounts
+                Resource: '*'
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - Fn::Sub: arn:aws:s3:::${S3BucketName}/*
+  LambdaSsmOsFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/LambdaSsmOsFunction
+      RetentionInDays: 7
+  LambdaSsmOsFunction:
+    DependsOn:
+      - LambdaSsmOsFunctionLogGroup
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      Timeout: 900
+      FunctionName: LambdaSsmOsFunction
+      Role: !GetAtt MasterAccountRole.Arn
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import base64
+          import boto3
+          import csv
+          from datetime import date
+          def lambda_handler(event, context):
+            region = event['region']
+            accounts = event['accountids']
+            bucket = event['bucket']
+            managementAccount = event['managementAccountId']
+            sts_client = boto3.client('sts')
+            # Initialize variable to hold all the details of instance
+            instanceReport = {}
+            # if account id list is nor specified explicitly, then check for accounts in organization
+            if len(accounts) == 0 and accounts == []:
+              # Initialize the Organizations client to list all accounts within the organization
+              # First check if management account id is specified, then go for default check
+                if len(managementAccount) == 0 and managementAccount == "" :
+                  org_client = boto3.client('organizations')
+                else:
+                  role_arn = f"arn:aws:iam::{managementAccount}:role/ManagementOrganizationRole"
+                  # Assume an IAM role in the Management account to access the organization account list
+                  management_assumed_role_object = sts_client.assume_role(
+                    RoleArn=role_arn,
+                    RoleSessionName="AssumedRoleSessionManagementAccount"
+                  )
+                  management_credentials = management_assumed_role_object['Credentials']
+                  # Create an org client using the assumed role credentials of Management account
+                  org_client = boto3.client(
+                    'organizations',
+                    aws_access_key_id=management_credentials['AccessKeyId'],
+                    aws_secret_access_key=management_credentials['SecretAccessKey'],
+                    aws_session_token=management_credentials['SessionToken']
+                    )
+                # Get all AWS accounts within the organization
+                accounts = []
+                response = org_client.list_accounts()
+                for account in response['Accounts']:
+                  accounts.append(account['Id'])
+                while 'NextToken' in response:
+                  response = org_client.list_accounts(NextToken=response['NextToken'])
+                  for account in response['Accounts']:
+                    accounts.append(account['Id'])
+                #print all accocunts
+                print(f"Accounts under organization: {accounts}")
+
+            for account in accounts:
+              print(f"Scanning account: {account}")
+              # Assume an IAM role in the account to access the ssm client
+              role_arn = f"arn:aws:iam::{account}:role/ssmLambdaRole"
+              try:
+                assumed_role_object = sts_client.assume_role(
+                  RoleArn=role_arn,
+                  RoleSessionName="AssumedRoleSession"
+                )
+                credentials = assumed_role_object['Credentials']
+                # Create an EC2 client in the account using the assumed role credentials
+                ec2_client = boto3.client(
+                  'ec2',
+                  aws_access_key_id=credentials['AccessKeyId'],
+                  aws_secret_access_key=credentials['SecretAccessKey'],
+                  aws_session_token=credentials['SessionToken']
+                )
+                # if region is not specified in the event then check all the regions fo the account
+                region_list = []
+                if region == []:
+                  region_response = ec2_client.describe_regions().get('Regions',[] )
+                  for response in region_response:
+                    region_list.append(response['RegionName'])
+                else:
+                  region_list = region
+                for regionId in region_list:
+                  try:
+                    ec2_resource = boto3.resource('ec2',aws_access_key_id=credentials['AccessKeyId'],
+                      aws_secret_access_key=credentials['SecretAccessKey'],
+                      aws_session_token=credentials['SessionToken'],
+                      region_name=regionId)
+                    # find list of all Ec2 in the region.
+                    instancesInRegion = ec2_resource.instances.filter(
+                      Filters=[
+                        {
+                          'Name': 'instance-state-name',
+                          'Values': [
+                            'stopped','running'
+                            ]
+                          }
+                        ]
+                      )
+                    instanceArray = []
+                    for instance in instancesInRegion:
+                      instanceArray.append(instance.id)
+                    ssm_client = boto3.client('ssm',
+                      aws_access_key_id=credentials['AccessKeyId'],
+                      aws_secret_access_key=credentials['SecretAccessKey'],
+                      aws_session_token=credentials['SessionToken'],
+                      region_name=regionId
+                    )
+                    response = ssm_client.describe_instance_information()
+                    paginator = ssm_client.get_paginator('describe_instance_information')
+                    page_iterator = paginator.paginate()
+                    for page in page_iterator:
+                      for result in page['InstanceInformationList']:
+                        if 'mi-' not in result['InstanceId']:
+                          instanceArray.remove(result['InstanceId'])
+                        InstanceId = result['InstanceId']
+                        instanceReport[InstanceId] = {}
+                        instanceReport[InstanceId]['AccountId'] = account
+                        instanceReport[InstanceId]['Region'] = regionId
+                        instanceReport[InstanceId]['InstanceId'] = InstanceId
+                        instanceReport[InstanceId]['PlatformType'] = result['PlatformType'] if 'PlatformType' in result else 'Platform type not found'
+                        instanceReport[InstanceId]['PlatformName'] = result['PlatformName'] if 'PlatformName' in result else 'Os Name not found'
+                        instanceReport[InstanceId]['PlatformVersion'] = result['PlatformVersion'] if 'PlatformVersion' in result else 'Os Version not found'
+                        instanceReport[InstanceId]['InformationSource'] = 'SSM'
+                    if len(instanceArray)>0:
+                      ec2_client = boto3.client('ec2',
+                        aws_access_key_id=credentials['AccessKeyId'],
+                        aws_secret_access_key=credentials['SecretAccessKey'],
+                        aws_session_token=credentials['SessionToken'],
+                        region_name=regionId
+                      )
+                      for instance in instanceArray:
+                        instanceDetail = ec2_client.describe_instances(
+                          InstanceIds=[
+                            instance
+                          ]
+                        )
+                        InstanceId = instanceDetail['Reservations'][0]['Instances'][0]['InstanceId']
+                        Instance = instanceDetail['Reservations'][0]['Instances'][0]
+                        ImageId = instanceDetail['Reservations'][0]['Instances'][0]['ImageId']
+                        imageDetails =  ec2_client.describe_images(
+                            ImageIds=[
+                                ImageId
+                            ]
+                        )
+                        instanceReport[InstanceId] = {}
+                        instanceReport[InstanceId]['AccountId']  = account
+                        instanceReport[InstanceId]['Region'] = regionId
+                        instanceReport[InstanceId]['InstanceId'] = InstanceId
+                        instanceReport[InstanceId]['PlatformType'] = Instance['PlatformDetails']
+                        instanceReport[InstanceId]['PlatformName'] = imageDetails['Images'][0]['Description']
+                        instanceReport[InstanceId]['PlatformVersion'] = imageDetails['Images'][0]['Name']
+                        instanceReport[InstanceId]['InformationSource'] = 'Ec2'
+                  except Exception as e:
+                    print(e)
+                    continue
+              except Exception as e:
+                print(e)
+                continue
+            print(instanceReport)
+            file_name = 'instanceReport.csv'
+            lambda_path = "/tmp/" + file_name
+            if len(instanceReport)>0:
+              current_date = str(date.today())
+              with open(lambda_path, 'w') as f:
+                w = csv.writer(f)
+                w.writerow(instanceReport[InstanceId].keys())
+                for i in instanceReport:
+                  w.writerow(instanceReport[i].values())
+              print("Uploading", lambda_path, "file in bucket", bucket, "at path s3://"+str(bucket)+"/ssm/instanceReport.csv")
+              s3_client = boto3.client('s3')
+              s3_path = 'ssm/'+current_date+'/instanceReport.csv'
+              response = s3_client.upload_file( lambda_path, bucket, s3_path)
+            else:
+              print("No data collected, report is empty. Not uploading any file to S3 bucket")
